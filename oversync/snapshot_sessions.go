@@ -139,6 +139,14 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 		// Phase 4: Batch 2 — 写入
 		snapshotID := uuid.NewString()
 		expiresAt := time.Now().UTC().Add(s.snapshotSessionTTL())
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO sync.snapshot_sessions (
+					snapshot_id, user_pk, snapshot_bundle_seq, row_count, byte_count, expires_at
+				) VALUES ($1::uuid, (SELECT user_pk FROM sync.user_state WHERE user_id = $2), $3, $4, $5, $6)
+			`, snapshotID, actor.UserID, snapshotBundleSeq, rowCount, byteCount, expiresAt); err != nil {
+				return fmt.Errorf("insert snapshot session: %w", err)
+			}
+
 		insertBr := tx.SendBatch(ctx, buildInsertBatch(snapshotID, rows))
 		if err := execInsertBatch(insertBr, rowCount); err != nil {
 			insertBr.Close()
