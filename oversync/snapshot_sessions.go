@@ -61,6 +61,7 @@ type snapshotMaterializedRow struct {
 	keyBytes    []byte
 	bundleSeq   int64
 	payloadWire []byte
+	rowOrdinal  int64
 }
 
 type snapshotLiveState struct {
@@ -124,21 +125,33 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 
 		snapshotID := uuid.NewString()
 		expiresAt := time.Now().UTC().Add(s.snapshotSessionTTL())
-		if _, err := tx.Exec(ctx, `
+
+		insertBatch := &pgx.Batch{}
+		insertBatch.Queue(`
 			INSERT INTO sync.snapshot_sessions (
 				snapshot_id, user_pk, snapshot_bundle_seq, row_count, byte_count, expires_at
 			) VALUES ($1::uuid, $2, $3, $4, $5, $6)
-		`, snapshotID, retainedState.UserPK, snapshotBundleSeq, rowCount, byteCount, expiresAt); err != nil {
-			return fmt.Errorf("insert snapshot session: %w", err)
-		}
-		for i, row := range rows {
-			if _, err := tx.Exec(ctx, `
+		`, snapshotID, retainedState.UserPK, snapshotBundleSeq, rowCount, byteCount, expiresAt)
+		for _, row := range rows {
+			insertBatch.Queue(`
 				INSERT INTO sync.snapshot_session_rows (
 					snapshot_id, row_ordinal, table_id, key_bytes, bundle_seq, payload_wire
 				) VALUES ($1::uuid, $2, $3, $4, $5, $6)
-			`, snapshotID, int64(i+1), row.tableID, row.keyBytes, row.bundleSeq, string(row.payloadWire)); err != nil {
-				return fmt.Errorf("insert snapshot session row %d: %w", i+1, err)
+			`, snapshotID, row.rowOrdinal, row.tableID, row.keyBytes, row.bundleSeq, string(row.payloadWire))
+		}
+		insertBr := tx.SendBatch(ctx, insertBatch)
+		if _, err := insertBr.Exec(); err != nil {
+			insertBr.Close()
+			return fmt.Errorf("insert snapshot session: %w", err)
+		}
+		for range rows {
+			if _, err := insertBr.Exec(); err != nil {
+				insertBr.Close()
+				return fmt.Errorf("insert snapshot session row: %w", err)
 			}
+		}
+		if err := insertBr.Close(); err != nil {
+			return fmt.Errorf("close insert batch: %w", err)
 		}
 
 		resp = &SnapshotSession{
@@ -270,6 +283,11 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, us
 		}
 		return bytes.Compare(rows[i].keyBytes, rows[j].keyBytes) < 0
 	})
+
+	// Assign row ordinals after sorting
+	for i := range rows {
+		rows[i].rowOrdinal = int64(i + 1)
+	}
 	return rows, byteCount, nil
 }
 
