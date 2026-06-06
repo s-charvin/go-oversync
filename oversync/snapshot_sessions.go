@@ -110,10 +110,15 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 		// Phase 1: Batch 1 — 全部读查询
 		readBatch, tableInfos := buildSnapshotReadBatch(actor.UserID, s.registeredTableByID)
 		readBr := tx.SendBatch(ctx, readBatch)
-		defer readBr.Close()
 
 		// Phase 2: 从 Batch 1 逐结果读取 + 验证
 		snapshotBundleSeq, rows, byteCount, rowErr := s.processSnapshotReadBatch(readBr, tableInfos, actor.UserID)
+		if err := readBr.Close(); err != nil {
+			if rowErr != nil {
+				return rowErr
+			}
+			return fmt.Errorf("close read batch: %w", err)
+		}
 		if rowErr != nil {
 			return rowErr
 		}
