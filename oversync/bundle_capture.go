@@ -83,17 +83,17 @@ func (s *SyncService) installRegisteredTableCaptureTriggers(ctx context.Context)
 			}
 
 			tableIdent := pgx.Identifier{table.normalizedSchema(), table.normalizedTable()}.Sanitize()
-			stmt := fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, registeredTableCaptureTriggerName, tableIdent)
+			stmt := fmt.Sprintf(; EXCEPTION WHEN OTHERS THEN NULL; END $$`DO $$ BEGIN DROP TRIGGER IF EXISTS %s ON %s; EXCEPTION WHEN OTHERS THEN NULL; END $$`, registeredTableCaptureTriggerName, tableIdent)
 			if _, err := tx.Exec(ctx, stmt); err != nil {
 				return fmt.Errorf("drop capture trigger for %s: %w", table.normalizedKey(), err)
 			}
-			stmt = fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, registeredTableOwnerGuardTrigger, tableIdent)
+			stmt = fmt.Sprintf(; EXCEPTION WHEN OTHERS THEN NULL; END $$`DO $$ BEGIN DROP TRIGGER IF EXISTS %s ON %s; EXCEPTION WHEN OTHERS THEN NULL; END $$`, registeredTableOwnerGuardTrigger, tableIdent)
 			if _, err := tx.Exec(ctx, stmt); err != nil {
 				return fmt.Errorf("drop owner guard trigger for %s: %w", table.normalizedKey(), err)
 			}
 
 			stmt = fmt.Sprintf(
-				`CREATE TRIGGER %s BEFORE INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.enforce_registered_row_owner()`,
+				`DO $_$ BEGIN CREATE TRIGGER %s BEFORE INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.enforce_registered_row_owner(); EXCEPTION WHEN duplicate_object THEN NULL; END $_$`,
 				registeredTableOwnerGuardTrigger,
 				tableIdent,
 			)
@@ -102,7 +102,7 @@ func (s *SyncService) installRegisteredTableCaptureTriggers(ctx context.Context)
 			}
 
 			stmt = fmt.Sprintf(
-				`CREATE TRIGGER %s AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.capture_registered_row_change(%s, %s, %s)`,
+				`DO $_$ BEGIN CREATE TRIGGER %s AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.capture_registered_row_change(%s, %s, %s; EXCEPTION WHEN duplicate_object THEN NULL; END $_$)`,
 				registeredTableCaptureTriggerName,
 				tableIdent,
 				quoteSQLLiteral(keyColumns[0]),
