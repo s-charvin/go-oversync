@@ -83,16 +83,29 @@ func (s *SyncService) installRegisteredTableCaptureTriggers(ctx context.Context)
 			}
 
 			tableIdent := pgx.Identifier{table.normalizedSchema(), table.normalizedTable()}.Sanitize()
-			stmt := fmt.Sprintf(`DO $$ BEGIN DROP TRIGGER IF EXISTS %s ON %s; EXCEPTION WHEN OTHERS THEN NULL; END $$`, registeredTableCaptureTriggerName, tableIdent)
-			if _, err := tx.Exec(ctx, stmt); err != nil {
-				return fmt.Errorf("drop capture trigger for %s: %w", table.normalizedKey(), err)
+
+			var captureExists, guardExists bool
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgname = $1)`,
+				registeredTableCaptureTriggerName,
+			).Scan(&captureExists); err != nil {
+				return fmt.Errorf("check capture trigger for %s: %w", table.normalizedKey(), err)
 			}
-			stmt = fmt.Sprintf(`DO $$ BEGIN DROP TRIGGER IF EXISTS %s ON %s; EXCEPTION WHEN OTHERS THEN NULL; END $$`, registeredTableOwnerGuardTrigger, tableIdent)
-			if _, err := tx.Exec(ctx, stmt); err != nil {
-				return fmt.Errorf("drop owner guard trigger for %s: %w", table.normalizedKey(), err)
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgname = $1)`,
+				registeredTableOwnerGuardTrigger,
+			).Scan(&guardExists); err != nil {
+				return fmt.Errorf("check owner guard trigger for %s: %w", table.normalizedKey(), err)
 			}
 
-			stmt = fmt.Sprintf(
+			if !guardExists {
+				stmt := fmt.Sprintf(
+					`DO $$ BEGIN DROP TRIGGER IF EXISTS %s ON %s; EXCEPTION WHEN OTHERS THEN NULL; END $$`, registeredTableOwnerGuardTrigger, tableIdent)
+				if _, err := tx.Exec(ctx, stmt); err != nil {
+					return fmt.Errorf("drop owner guard trigger for %s: %w", table.normalizedKey(), err)
+				}
+			}
+			stmt := fmt.Sprintf(
 				`DO $_$ BEGIN CREATE TRIGGER %s BEFORE INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.enforce_registered_row_owner(); EXCEPTION WHEN duplicate_object THEN NULL; END $_$`,
 				registeredTableOwnerGuardTrigger,
 				tableIdent,
@@ -101,6 +114,13 @@ func (s *SyncService) installRegisteredTableCaptureTriggers(ctx context.Context)
 				return fmt.Errorf("create owner guard trigger for %s: %w", table.normalizedKey(), err)
 			}
 
+			if !captureExists {
+				stmt = fmt.Sprintf(
+					`DO $$ BEGIN DROP TRIGGER IF EXISTS %s ON %s; EXCEPTION WHEN OTHERS THEN NULL; END $$`, registeredTableCaptureTriggerName, tableIdent)
+				if _, err := tx.Exec(ctx, stmt); err != nil {
+					return fmt.Errorf("drop capture trigger for %s: %w", table.normalizedKey(), err)
+				}
+			}
 			stmt = fmt.Sprintf(
 				`DO $_$ BEGIN CREATE TRIGGER %s AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.capture_registered_row_change(%s, %s, %s); EXCEPTION WHEN duplicate_object THEN NULL; END $_$`,
 				registeredTableCaptureTriggerName,
