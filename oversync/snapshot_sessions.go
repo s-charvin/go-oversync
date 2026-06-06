@@ -231,81 +231,22 @@ func (s *SyncService) applySnapshotSourceReplacementInTx(ctx context.Context, tx
 }
 
 func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, userID string, userPK int64) ([]snapshotMaterializedRow, int64, error) {
-	liveRowState, err := loadSnapshotLiveRowState(ctx, tx, userPK)
+	batch, tableInfos := buildSnapshotBatch(userPK, userID, s.registeredTableByID)
+	br := tx.SendBatch(ctx, batch)
+	defer br.Close()
+
+	liveRowState, err := readBatchLiveRowState(br)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("read batch live row state: %w", err)
 	}
+
 	seen := make(map[string]struct{}, len(liveRowState))
 	rows := make([]snapshotMaterializedRow, 0, len(liveRowState))
 	var byteCount int64
-
-	tableInfos := make([]registeredTableRuntimeInfo, 0, len(s.registeredTableByID))
-	for _, info := range s.registeredTableByID {
-		tableInfos = append(tableInfos, info)
-	}
-	sort.Slice(tableInfos, func(i, j int) bool {
-		return tableInfos[i].tableID < tableInfos[j].tableID
-	})
-
 	for _, info := range tableInfos {
-		tableIdent := pgx.Identifier{info.schemaName, info.tableName}.Sanitize()
-		keyColumnIdent := pgx.Identifier{info.syncKeyColumn}.Sanitize()
-		ownerColumnIdent := pgx.Identifier{syncScopeColumnName}.Sanitize()
-		query := fmt.Sprintf(`
-			SELECT CAST(src.%s AS text), to_jsonb(src) - '_sync_scope_id'
-			FROM %s AS src
-			WHERE src.%s = $1
-			ORDER BY CAST(src.%s AS text)
-		`, keyColumnIdent, tableIdent, ownerColumnIdent, keyColumnIdent)
-		liveRows, err := tx.Query(ctx, query, userID)
-		if err != nil {
-			return nil, 0, fmt.Errorf("query live snapshot rows for %s.%s: %w", info.schemaName, info.tableName, err)
+		if err := readBatchTableRows(br, &info, liveRowState, seen, &rows, &byteCount, s); err != nil {
+			return nil, 0, fmt.Errorf("read batch rows for %s.%s: %w", info.schemaName, info.tableName, err)
 		}
-
-		for liveRows.Next() {
-			var (
-				keyText   string
-				payloadDB []byte
-			)
-			if err := liveRows.Scan(&keyText, &payloadDB); err != nil {
-				liveRows.Close()
-				return nil, 0, fmt.Errorf("scan live snapshot row for %s.%s: %w", info.schemaName, info.tableName, err)
-			}
-			keyBytes, _, err := encodeKeyBytes(info.syncKeyType, keyText)
-			if err != nil {
-				liveRows.Close()
-				return nil, 0, fmt.Errorf("encode live snapshot key for %s.%s: %w", info.schemaName, info.tableName, err)
-			}
-			logicalKey := snapshotLogicalRowKey(info.tableID, keyBytes)
-			state, ok := liveRowState[logicalKey]
-			if !ok {
-				liveRows.Close()
-				return nil, 0, fmt.Errorf("live row %s.%s %q is missing non-deleted sync.row_state", info.schemaName, info.tableName, keyText)
-			}
-			if _, duplicate := seen[logicalKey]; duplicate {
-				liveRows.Close()
-				return nil, 0, fmt.Errorf("duplicate live snapshot row detected for %s.%s %q", info.schemaName, info.tableName, keyText)
-			}
-			seen[logicalKey] = struct{}{}
-
-			payloadWire, err := s.canonicalizeWirePayload(info.schemaName, info.tableName, payloadDB)
-			if err != nil {
-				liveRows.Close()
-				return nil, 0, fmt.Errorf("canonicalize live snapshot payload for %s.%s: %w", info.schemaName, info.tableName, err)
-			}
-			byteCount += int64(len(payloadWire))
-			rows = append(rows, snapshotMaterializedRow{
-				tableID:     info.tableID,
-				keyBytes:    append([]byte(nil), keyBytes...),
-				bundleSeq:   state.bundleSeq,
-				payloadWire: append([]byte(nil), payloadWire...),
-			})
-		}
-		if err := liveRows.Err(); err != nil {
-			liveRows.Close()
-			return nil, 0, fmt.Errorf("iterate live snapshot rows for %s.%s: %w", info.schemaName, info.tableName, err)
-		}
-		liveRows.Close()
 	}
 
 	for logicalKey, state := range liveRowState {
@@ -332,15 +273,35 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, us
 	return rows, byteCount, nil
 }
 
-func loadSnapshotLiveRowState(ctx context.Context, tx pgx.Tx, userPK int64) (map[string]snapshotLiveState, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT table_id, key_bytes, bundle_seq
+func buildSnapshotBatch(userPK int64, userID string, registeredByID map[int32]registeredTableRuntimeInfo) (*pgx.Batch, []registeredTableRuntimeInfo) {
+	batch := &pgx.Batch{}
+	batch.Queue(`SELECT table_id, key_bytes, bundle_seq
 		FROM sync.row_state
-		WHERE user_pk = $1
-		  AND deleted = FALSE
-	`, userPK)
+		WHERE user_pk = $1 AND deleted = FALSE`, userPK)
+
+	tableInfos := sortedTableInfos(registeredByID)
+	for _, info := range tableInfos {
+		batch.Queue(buildTableSnapshotQuery(info), userID)
+	}
+	return batch, tableInfos
+}
+
+func buildTableSnapshotQuery(info registeredTableRuntimeInfo) string {
+	tableIdent := pgx.Identifier{info.schemaName, info.tableName}.Sanitize()
+	keyCol := pgx.Identifier{info.syncKeyColumn}.Sanitize()
+	ownerCol := pgx.Identifier{syncScopeColumnName}.Sanitize()
+	return fmt.Sprintf(`
+		SELECT CAST(src.%s AS text), to_jsonb(src) - '_sync_scope_id'
+		FROM %s AS src
+		WHERE src.%s = $1
+		ORDER BY CAST(src.%s AS text)
+	`, keyCol, tableIdent, ownerCol, keyCol)
+}
+
+func readBatchLiveRowState(br pgx.BatchResults) (map[string]snapshotLiveState, error) {
+	rows, err := br.Query()
 	if err != nil {
-		return nil, fmt.Errorf("query live snapshot row_state: %w", err)
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -357,6 +318,72 @@ func loadSnapshotLiveRowState(ctx context.Context, tx pgx.Tx, userPK int64) (map
 		return nil, fmt.Errorf("iterate live snapshot row_state: %w", err)
 	}
 	return liveState, nil
+}
+
+func readBatchTableRows(
+	br pgx.BatchResults,
+	info *registeredTableRuntimeInfo,
+	liveRowState map[string]snapshotLiveState,
+	seen map[string]struct{},
+	rows *[]snapshotMaterializedRow,
+	byteCount *int64,
+	s *SyncService,
+) error {
+	liveRows, err := br.Query()
+	if err != nil {
+		return err
+	}
+	defer liveRows.Close()
+
+	for liveRows.Next() {
+		var (
+			keyText   string
+			payloadDB []byte
+		)
+		if err := liveRows.Scan(&keyText, &payloadDB); err != nil {
+			return fmt.Errorf("scan live snapshot row for %s.%s: %w", info.schemaName, info.tableName, err)
+		}
+		keyBytes, _, err := encodeKeyBytes(info.syncKeyType, keyText)
+		if err != nil {
+			return fmt.Errorf("encode live snapshot key for %s.%s: %w", info.schemaName, info.tableName, err)
+		}
+		logicalKey := snapshotLogicalRowKey(info.tableID, keyBytes)
+		state, ok := liveRowState[logicalKey]
+		if !ok {
+			return fmt.Errorf("live row %s.%s %q is missing non-deleted sync.row_state", info.schemaName, info.tableName, keyText)
+		}
+		if _, duplicate := seen[logicalKey]; duplicate {
+			return fmt.Errorf("duplicate live snapshot row detected for %s.%s %q", info.schemaName, info.tableName, keyText)
+		}
+		seen[logicalKey] = struct{}{}
+
+		payloadWire, err := s.canonicalizeWirePayload(info.schemaName, info.tableName, payloadDB)
+		if err != nil {
+			return fmt.Errorf("canonicalize live snapshot payload for %s.%s: %w", info.schemaName, info.tableName, err)
+		}
+		*byteCount += int64(len(payloadWire))
+		*rows = append(*rows, snapshotMaterializedRow{
+			tableID:     info.tableID,
+			keyBytes:    append([]byte(nil), keyBytes...),
+			bundleSeq:   state.bundleSeq,
+			payloadWire: append([]byte(nil), payloadWire...),
+		})
+	}
+	if err := liveRows.Err(); err != nil {
+		return fmt.Errorf("iterate live snapshot rows for %s.%s: %w", info.schemaName, info.tableName, err)
+	}
+	return nil
+}
+
+func sortedTableInfos(registeredByID map[int32]registeredTableRuntimeInfo) []registeredTableRuntimeInfo {
+	infos := make([]registeredTableRuntimeInfo, 0, len(registeredByID))
+	for _, info := range registeredByID {
+		infos = append(infos, info)
+	}
+	sort.Slice(infos, func(i, j int) bool {
+		return infos[i].tableID < infos[j].tableID
+	})
+	return infos
 }
 
 func (s *SyncService) GetSnapshotChunk(ctx context.Context, actor Actor, snapshotID string, afterRowOrdinal int64, maxRows int) (_ *SnapshotChunkResponse, err error) {
