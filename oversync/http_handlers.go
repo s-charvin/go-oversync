@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // HTTPSyncHandlers provides HTTP handlers for the two-way sync API
@@ -274,8 +276,14 @@ func (h *HTTPSyncHandlers) HandleCommitPushSession(w http.ResponseWriter, r *htt
 			h.writeSourceRetired(w, retiredErr)
 			return
 		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			h.logger.Error("Failed to commit push session (PostgreSQL error)", "error", err, "user_id", actor.UserID, "push_id", pushID, "sql_state", pgErr.SQLState(), "sql_message", pgErr.Message)
+			h.writeError(w, http.StatusInternalServerError, "push_session_commit_failed", fmt.Sprintf("Database error [%s]: %s", pgErr.SQLState(), pgErr.Message))
+			return
+		}
 		h.logger.Error("Failed to commit push session", "error", err, "user_id", actor.UserID, "push_id", pushID)
-		h.writeError(w, http.StatusInternalServerError, "push_session_commit_failed", "Failed to commit push session")
+		h.writeError(w, http.StatusInternalServerError, "push_session_commit_failed", err.Error())
 		return
 	}
 
